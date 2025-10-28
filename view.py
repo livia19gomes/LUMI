@@ -1,11 +1,14 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from main import app, con
-
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from io import BytesIO
+import unicodedata
 
 app = Flask(__name__)
 CORS(app, origins=["*"])
@@ -50,6 +53,12 @@ def verificar_adm(id_cadastro):
         return True
     else:
         return False
+
+def normalizar_texto(texto):
+    if texto is None:
+        return ""
+    texto = str(texto)
+    return unicodedata.normalize('NFC', texto)
 
 @app.route('/cadastro', methods=['POST'])
 def cadastro_usuario():
@@ -353,29 +362,6 @@ def cadastrar_servico():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/horarios_disponiveis', methods=['GET'])
-def listar_horarios():
-    try:
-        data = request.args.get('data')
-        id_profissional = request.args.get('id_profissional')
-        id_servico = request.args.get('id_servico')
-
-        if not data or not id_profissional or not id_servico:
-            return jsonify({"error": "Parâmetros obrigatórios: data, id_profissional, id_servico"}), 400
-
-        cur = con.cursor()
-        cur.execute("""
-            SELECT HORARIO 
-            FROM PR_HORARIOS_DISPONIVEIS(?, ?, ?)
-        """, (data, id_profissional, id_servico))
-
-        horarios = [row[0].strftime("%Y-%m-%d %H:%M:%S") for row in cur.fetchall()]
-
-        return jsonify(horarios)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 @app.route('/servico', methods=['GET'])
 def listar_servicos():
     try:
@@ -432,6 +418,29 @@ def editar_servico(id_servico):
         cur.close()
 
         return jsonify({"message": "Serviço atualizado com sucesso!"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/horarios_disponiveis', methods=['GET'])
+def listar_horarios():
+    try:
+        data = request.args.get('data')
+        id_profissional = request.args.get('id_profissional')
+        id_servico = request.args.get('id_servico')
+
+        if not data or not id_profissional or not id_servico:
+            return jsonify({"error": "Parâmetros obrigatórios: data, id_profissional, id_servico"}), 400
+
+        cur = con.cursor()
+        cur.execute("""
+            SELECT HORARIO 
+            FROM PR_HORARIOS_DISPONIVEIS(?, ?, ?)
+        """, (data, id_profissional, id_servico))
+
+        horarios = [row[0].strftime("%Y-%m-%d %H:%M:%S") for row in cur.fetchall()]
+
+        return jsonify(horarios)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -597,24 +606,36 @@ def painel_admin():
         # Número de agendamentos
         cur.execute("""
             SELECT COUNT(*)
-            FROM RESERVA
-            WHERE DATA_RESERVA BETWEEN ? AND ?
+            FROM AGENDA
+            WHERE DATA_HORA BETWEEN ? AND ?
         """, (data_inicial, data_final))
         numero_agendamentos = cur.fetchone()[0] or 0
 
-        # Faturamento total
+        # Faturamento total e por serviço
         cur.execute("""
-            SELECT SUM(VALOR_TOTAL)
-            FROM RESERVA
-            WHERE DATA_RESERVA BETWEEN ? AND ?
+            SELECT S.DESCRICAO, COUNT(A.ID_AGENDA) AS qtd, SUM(S.VALOR) AS total
+            FROM AGENDA A
+            JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
+            WHERE A.DATA_HORA BETWEEN ? AND ?
+            GROUP BY S.DESCRICAO
         """, (data_inicial, data_final))
-        faturamento = cur.fetchone()[0] or 0
+        resultados = cur.fetchall()
+
+        faturamento_total = 0
+        faturamento_por_servico = []
+        for servico, qtd, total in resultados:
+            faturamento_total += total or 0
+            faturamento_por_servico.append({
+                "servico": servico,
+                "quantidade": qtd,
+                "total": float(total or 0)
+            })
 
         # Quantidade de clientes distintos
         cur.execute("""
             SELECT COUNT(DISTINCT ID_CADASTRO)
-            FROM RESERVA
-            WHERE DATA_RESERVA BETWEEN ? AND ?
+            FROM AGENDA
+            WHERE DATA_HORA BETWEEN ? AND ?
         """, (data_inicial, data_final))
         quantidade_clientes = cur.fetchone()[0] or 0
 
@@ -622,10 +643,223 @@ def painel_admin():
 
         return jsonify({
             "numero_agendamentos": numero_agendamentos,
-            "faturamento": round(float(faturamento), 2),
+            "faturamento_total": round(float(faturamento_total), 2),
+            "faturamento_por_servico": faturamento_por_servico,
             "quantidade_clientes": quantidade_clientes,
             "mensagem": "Painel Administrativo"
         }), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/relatorio-agendamentos', methods=['GET'])
+def relatorio_agendamentos():
+    try:
+        cur = con.cursor()
+
+        data_inicial = request.args.get('data_inicial')
+        data_final = request.args.get('data_final')
+        if not data_inicial or not data_final:
+            hoje = date.today().isoformat()
+            data_inicial = hoje
+            data_final = hoje
+
+        cur.execute("""
+            SELECT S.DESCRICAO, COUNT(A.ID_AGENDA)
+            FROM AGENDA A
+            JOIN SERVICO S ON S.ID_SERVICO = A.ID_SERVICO
+            WHERE A.DATA_HORA BETWEEN ? AND ?
+            GROUP BY S.DESCRICAO
+        """, (data_inicial, data_final))
+
+        resultados = cur.fetchall()
+        cur.close()
+
+        buffer = BytesIO()
+        pdf = canvas.Canvas(buffer, pagesize=A4)
+        largura, altura = A4
+
+        pdf.setTitle("Relatório de Agendamentos")
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(200, 800, "Relatório de Agendamentos")
+        pdf.setFont("Helvetica", 10)
+        pdf.drawString(50, 780, f"Período: {data_inicial} até {data_final}")
+        pdf.line(50, 775, 550, 775)
+
+        y = 750
+        total_agendamentos = 0
+
+        pdf.setFont("Helvetica-Bold", 11)
+        pdf.drawString(50, y, "Serviço")
+        pdf.drawString(400, y, "Qtd. Agendamentos")
+        pdf.setFont("Helvetica", 10)
+        y -= 20
+
+        for servico, qtd in resultados:
+            pdf.drawString(50, y, normalizar_texto(servico))
+            pdf.drawString(430, y, str(qtd))
+            total_agendamentos += qtd
+            y -= 18
+            if y < 100:
+                pdf.showPage()
+                y = 800
+                pdf.setFont("Helvetica", 10)
+
+        pdf.line(50, y-5, 550, y-5)
+        pdf.setFont("Helvetica-Bold", 11)
+        pdf.drawString(50, y-25, f"Total de Agendamentos: {total_agendamentos}")
+
+        pdf.save()
+        buffer.seek(0)
+
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=f"relatorio_agendamentos_{data_inicial}_a_{data_final}.pdf",
+            mimetype='application/pdf'
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+@app.route('/relatorio-faturamento', methods=['GET'])
+def relatorio_faturamento():
+    try:
+        cur = con.cursor()
+
+        data_inicial = request.args.get('data_inicial')
+        data_final = request.args.get('data_final')
+        if not data_inicial or not data_final:
+            hoje = date.today().isoformat()
+            data_inicial = hoje
+            data_final = hoje
+
+        cur.execute("""
+            SELECT S.DESCRICAO, COUNT(A.ID_AGENDA) AS qtd, S.VALOR AS valor_unitario
+            FROM AGENDA A
+            JOIN SERVICO S ON S.ID_SERVICO = A.ID_SERVICO
+            WHERE A.DATA_HORA BETWEEN ? AND ?
+            GROUP BY S.DESCRICAO, S.VALOR
+        """, (data_inicial, data_final))
+
+        resultados = cur.fetchall()
+        cur.close()
+
+        buffer = BytesIO()
+        pdf = canvas.Canvas(buffer, pagesize=A4)
+        largura, altura = A4
+
+        pdf.setTitle("Relatório de Faturamento")
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(180, 800, "Relatório de Faturamento")
+        pdf.setFont("Helvetica", 10)
+        pdf.drawString(50, 780, f"Período: {data_inicial} até {data_final}")
+        pdf.line(50, 775, 550, 775)
+
+        y = 750
+        total_geral = 0
+
+        pdf.setFont("Helvetica-Bold", 11)
+        pdf.drawString(50, y, "Serviço")
+        pdf.drawString(250, y, "Qtd.")
+        pdf.drawString(330, y, "Valor Unitário")
+        pdf.drawString(450, y, "Total")
+        pdf.setFont("Helvetica", 10)
+        y -= 20
+
+        for servico, qtd, valor_unitario in resultados:
+            total_servico = qtd * valor_unitario
+            total_geral += total_servico
+            pdf.drawString(50, y, normalizar_texto(servico))
+            pdf.drawString(260, y, str(qtd))
+            pdf.drawString(350, y, f"R$ {valor_unitario:.2f}")
+            pdf.drawString(450, y, f"R$ {total_servico:.2f}")
+            y -= 18
+            if y < 100:
+                pdf.showPage()
+                y = 800
+                pdf.setFont("Helvetica", 10)
+
+        pdf.line(50, y-5, 550, y-5)
+        pdf.setFont("Helvetica-Bold", 11)
+        pdf.drawString(50, y-25, f"Total Faturamento: R$ {total_geral:.2f}")
+
+        pdf.save()
+        buffer.seek(0)
+
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=f"relatorio_faturamento_{data_inicial}_a_{data_final}.pdf",
+            mimetype='application/pdf'
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/relatorio-clientes', methods=['GET'])
+def relatorio_clientes():
+    try:
+        cur = con.cursor()
+
+        data_inicial = request.args.get('data_inicial')
+        data_final = request.args.get('data_final')
+        if not data_inicial or not data_final:
+            hoje = date.today().isoformat()
+            data_inicial = hoje
+            data_final = hoje
+
+        cur.execute("""
+            SELECT DISTINCT C.NOME
+            FROM AGENDA A
+            JOIN CADASTRO C ON C.ID_CADASTRO = A.ID_CADASTRO
+            WHERE A.DATA_HORA BETWEEN ? AND ?
+            ORDER BY C.NOME
+        """, (data_inicial, data_final))
+
+        clientes = cur.fetchall()
+        cur.close()
+
+        buffer = BytesIO()
+        pdf = canvas.Canvas(buffer, pagesize=A4)
+        largura, altura = A4
+
+        pdf.setTitle("Relatório de Clientes")
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(180, 800, "Relatório de Clientes")
+        pdf.setFont("Helvetica", 10)
+        pdf.drawString(50, 780, f"Período: {data_inicial} até {data_final}")
+        pdf.line(50, 775, 550, 775)
+
+        y = 750
+        total_clientes = len(clientes)
+
+        pdf.setFont("Helvetica-Bold", 11)
+        pdf.drawString(50, y, "Clientes")
+        pdf.setFont("Helvetica", 10)
+        y -= 20
+
+        for (nome,) in clientes:
+            pdf.drawString(50, y, normalizar_texto(nome))
+            y -= 18
+            if y < 100:
+                pdf.showPage()
+                y = 800
+                pdf.setFont("Helvetica", 10)
+
+        pdf.line(50, y-5, 550, y-5)
+        pdf.setFont("Helvetica-Bold", 11)
+        pdf.drawString(50, y-25, f"Total de Clientes: {total_clientes}")
+
+        pdf.save()
+        buffer.seek(0)
+
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=f"relatorio_clientes_{data_inicial}_a_{data_final}.pdf",
+            mimetype='application/pdf'
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
